@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from pydantic import Field, field_validator
@@ -13,14 +14,10 @@ class Settings(BaseSettings):
     All application configuration loaded from environment variables.
     Validated on startup — app refuses to start if required vars are missing.
     Fail fast is better than failing mysteriously at runtime.
-
-    Uses pydantic-settings which automatically reads from:
-    1. Environment variables
-    2. .env file (via env_file config)
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.path.join(os.path.dirname(__file__), "..", "..", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore"
@@ -36,7 +33,7 @@ class Settings(BaseSettings):
         default=0.1,
         ge=0.0,
         le=2.0,
-        description="LLM temperature. Low = deterministic, high = creative. Agents need low."
+        description="LLM temperature. Low = deterministic, high = creative."
     )
     llm_max_tokens: int = Field(
         default=2048,
@@ -152,12 +149,7 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """
     Returns the singleton Settings instance.
-    Cached after first call — settings are loaded once at startup.
+    Cached after first call — settings loaded once at startup.
     Use get_settings() everywhere instead of Settings() directly.
-
-    Usage:
-        from config.settings import get_settings
-        settings = get_settings()
-        namespace = settings.k8s_namespace
     """
     return Settings()
