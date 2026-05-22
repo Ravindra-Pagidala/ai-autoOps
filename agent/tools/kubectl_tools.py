@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-from typing import Optional
 
 import structlog
 from tenacity import (
@@ -12,6 +11,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from config.settings import get_settings
+from exceptions.kubectl_exceptions import KubectlError, KubectlTimeoutError
 from models.kubectl_models import (
     DeploymentActionResult,
     DeploymentCondition,
@@ -19,8 +20,8 @@ from models.kubectl_models import (
     DeploymentSummary,
     PodInfo,
     PodStatusResult,
-    validate_deployment_name,
 )
+from utils.validators import validate_deployment_name, validate_replica_count
 
 __all__ = [
     "get_pod_status",
@@ -34,20 +35,13 @@ __all__ = [
 
 logger = structlog.get_logger(__name__)
 
-NAMESPACE = "autoops"
-DEFAULT_KUBECTL_TIMEOUT = 30
+
+def _get_namespace() -> str:
+    return get_settings().k8s_namespace
 
 
-# ── Exceptions ─────────────────────────────────────────────────────────────────
-
-class KubectlError(Exception):
-    """Raised when a kubectl command exits with non-zero code."""
-    pass
-
-
-class KubectlTimeoutError(KubectlError):
-    """Raised when a kubectl command exceeds its timeout."""
-    pass
+def _get_timeout() -> int:
+    return get_settings().kubectl_timeout_seconds
 
 
 # ── Core Executor ──────────────────────────────────────────────────────────────
@@ -56,19 +50,19 @@ class KubectlTimeoutError(KubectlError):
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=8),
     retry=retry_if_exception_type(KubectlTimeoutError),
-    reraise=True
+    reraise=True,
 )
-def _run_kubectl(args: list[str], timeout: int = DEFAULT_KUBECTL_TIMEOUT) -> str:
+def _run_kubectl(args: list[str], timeout: int | None = None) -> str:
     """
-    Core kubectl executor. Every kubectl call goes through here.
+    Core kubectl executor. Every kubectl call in this module goes through here.
 
-    - Uses list args (never shell=True) — prevents shell injection
-    - Enforces timeout on every call
-    - Retries on timeout (transient) but NOT on KubectlError (permanent failures)
-    - Logs before and after every call for full observability
+    Security: uses list args with shell=False — prevents shell injection.
+    Reliability: retries on timeout (transient), not on KubectlError (permanent).
+    Observability: logs command, result, and errors with full context.
     """
+    effective_timeout = timeout or _get_timeout()
     command = ["kubectl"] + args
-    log = logger.bind(command=" ".join(command))
+    log = logger.bind(command=" ".join(command), timeout=effective_timeout)
     log.info("kubectl_executing")
 
     try:
@@ -76,23 +70,33 @@ def _run_kubectl(args: list[str], timeout: int = DEFAULT_KUBECTL_TIMEOUT) -> str
             command,
             capture_output=True,
             text=True,
-            timeout=timeout,
-            shell=False  # explicit — never use shell=True with user-influenced args
+            timeout=effective_timeout,
+            shell=False,
         )
     except subprocess.TimeoutExpired:
-        log.error("kubectl_timeout", timeout_seconds=timeout)
+        log.error("kubectl_timeout", timeout_seconds=effective_timeout)
         raise KubectlTimeoutError(
-            f"kubectl timed out after {timeout}s: {' '.join(command)}"
+            message=f"kubectl timed out after {effective_timeout}s",
+            command=" ".join(command),
+            timeout_seconds=effective_timeout,
+        )
+    except FileNotFoundError:
+        log.error("kubectl_not_found")
+        raise KubectlError(
+            message="kubectl binary not found. Is it installed and in PATH?",
+            command=" ".join(command),
         )
 
     if result.returncode != 0:
         log.error(
             "kubectl_failed",
             returncode=result.returncode,
-            stderr=result.stderr.strip()
+            stderr=result.stderr.strip(),
         )
         raise KubectlError(
-            f"kubectl failed (exit {result.returncode}): {result.stderr.strip()}"
+            message=f"kubectl failed (exit {result.returncode}): {result.stderr.strip()}",
+            command=" ".join(command),
+            returncode=result.returncode,
         )
 
     log.info("kubectl_succeeded", output_preview=result.stdout.strip()[:150])
@@ -103,18 +107,19 @@ def _run_kubectl(args: list[str], timeout: int = DEFAULT_KUBECTL_TIMEOUT) -> str
 
 def get_pod_status(deployment_name: str) -> PodStatusResult:
     """
-    Returns current pod health status for a deployment.
-    Used by the validator agent to confirm remediation success.
+    Returns current pod health for a deployment.
+    Used by validator agent after remediation to confirm recovery.
     """
     validated_name = validate_deployment_name(deployment_name)
-    log = logger.bind(deployment=validated_name, namespace=NAMESPACE)
+    namespace = _get_namespace()
+    log = logger.bind(deployment=validated_name, namespace=namespace)
     log.info("get_pod_status_start")
 
     output = _run_kubectl([
         "get", "pods",
-        "-n", NAMESPACE,
+        "-n", namespace,
         "-l", f"app={validated_name}",
-        "-o", "json"
+        "-o", "json",
     ])
 
     data = json.loads(output)
@@ -128,7 +133,9 @@ def get_pod_status(deployment_name: str) -> PodStatusResult:
     for pod in pods_raw:
         phase = pod["status"].get("phase", "Unknown")
         container_statuses = pod["status"].get("containerStatuses", [])
-        is_ready = all(cs.get("ready", False) for cs in container_statuses)
+        is_ready = bool(container_statuses) and all(
+            cs.get("ready", False) for cs in container_statuses
+        )
         restart_count = sum(cs.get("restartCount", 0) for cs in container_statuses)
 
         if phase == "Running":
@@ -141,7 +148,7 @@ def get_pod_status(deployment_name: str) -> PodStatusResult:
             name=pod["metadata"]["name"],
             phase=phase,
             ready=is_ready,
-            restarts=restart_count
+            restarts=restart_count,
         ))
 
     result = PodStatusResult(
@@ -151,7 +158,7 @@ def get_pod_status(deployment_name: str) -> PodStatusResult:
         ready=ready_count,
         restarts=total_restarts,
         pods=pod_infos,
-        healthy=(len(pods_raw) > 0 and ready_count == len(pods_raw))
+        healthy=(len(pods_raw) > 0 and ready_count == len(pods_raw)),
     )
 
     log.info(
@@ -159,7 +166,7 @@ def get_pod_status(deployment_name: str) -> PodStatusResult:
         total=result.total,
         running=result.running,
         ready=result.ready,
-        healthy=result.healthy
+        healthy=result.healthy,
     )
     return result
 
@@ -170,22 +177,23 @@ def get_pod_status(deployment_name: str) -> PodStatusResult:
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(KubectlError),
-    reraise=True
+    reraise=True,
 )
 def restart_deployment(deployment_name: str) -> DeploymentActionResult:
     """
-    Performs a rolling restart of a deployment.
-    K8s replaces pods one by one — zero downtime.
-    Retries up to 3 times with exponential backoff on failure.
+    Performs a rolling restart — replaces pods one by one, zero downtime.
+    Primary remediation for pod crash loops and stuck deployments.
+    Retries up to 3 times with exponential backoff.
     """
     validated_name = validate_deployment_name(deployment_name)
-    log = logger.bind(deployment=validated_name, namespace=NAMESPACE)
+    namespace = _get_namespace()
+    log = logger.bind(deployment=validated_name, namespace=namespace)
     log.info("restart_deployment_start")
 
     _run_kubectl([
         "rollout", "restart",
         f"deployment/{validated_name}",
-        "-n", NAMESPACE
+        "-n", namespace,
     ])
 
     log.info("restart_deployment_success")
@@ -193,7 +201,7 @@ def restart_deployment(deployment_name: str) -> DeploymentActionResult:
         success=True,
         deployment=validated_name,
         action="restart",
-        message=f"Rolling restart triggered for deployment/{validated_name}"
+        message=f"Rolling restart triggered for deployment/{validated_name}",
     )
 
 
@@ -203,36 +211,34 @@ def restart_deployment(deployment_name: str) -> DeploymentActionResult:
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(KubectlError),
-    reraise=True
+    reraise=True,
 )
 def scale_deployment(deployment_name: str, replicas: int) -> DeploymentActionResult:
     """
     Scales a deployment to the specified replica count.
-    Validates replica bounds before touching kubectl.
-    Retries up to 3 times with exponential backoff on failure.
+    Used to scale up under load or scale down to force pod recreation.
+    Validates bounds before touching kubectl.
+    Retries up to 3 times with exponential backoff.
     """
     validated_name = validate_deployment_name(deployment_name)
-
-    if not (0 <= replicas <= 20):
-        raise ValueError(
-            f"Invalid replica count: {replicas}. Must be between 0 and 20."
-        )
+    validated_replicas = validate_replica_count(replicas, deployment_name)
+    namespace = _get_namespace()
 
     current_info = get_deployment_info(validated_name)
     previous_replicas = current_info.desired_replicas
 
     log = logger.bind(
         deployment=validated_name,
-        namespace=NAMESPACE,
+        namespace=namespace,
         from_replicas=previous_replicas,
-        to_replicas=replicas
+        to_replicas=validated_replicas,
     )
     log.info("scale_deployment_start")
 
     _run_kubectl([
         "scale", f"deployment/{validated_name}",
-        f"--replicas={replicas}",
-        "-n", NAMESPACE
+        f"--replicas={validated_replicas}",
+        "-n", namespace,
     ])
 
     log.info("scale_deployment_success")
@@ -240,9 +246,12 @@ def scale_deployment(deployment_name: str, replicas: int) -> DeploymentActionRes
         success=True,
         deployment=validated_name,
         action="scale",
-        message=f"Scaled deployment/{validated_name} from {previous_replicas} to {replicas} replicas",
+        message=(
+            f"Scaled deployment/{validated_name} "
+            f"from {previous_replicas} to {validated_replicas} replicas"
+        ),
         previous_replicas=previous_replicas,
-        new_replicas=replicas
+        new_replicas=validated_replicas,
     )
 
 
@@ -252,22 +261,23 @@ def scale_deployment(deployment_name: str, replicas: int) -> DeploymentActionRes
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(KubectlError),
-    reraise=True
+    reraise=True,
 )
 def rollback_deployment(deployment_name: str) -> DeploymentActionResult:
     """
     Rolls back a deployment to its previous revision.
     Used when a bad deployment causes cascading failures.
-    Retries up to 3 times with exponential backoff on failure.
+    Retries up to 3 times with exponential backoff.
     """
     validated_name = validate_deployment_name(deployment_name)
-    log = logger.bind(deployment=validated_name, namespace=NAMESPACE)
+    namespace = _get_namespace()
+    log = logger.bind(deployment=validated_name, namespace=namespace)
     log.info("rollback_deployment_start")
 
     _run_kubectl([
         "rollout", "undo",
         f"deployment/{validated_name}",
-        "-n", NAMESPACE
+        "-n", namespace,
     ])
 
     log.info("rollback_deployment_success")
@@ -275,7 +285,7 @@ def rollback_deployment(deployment_name: str) -> DeploymentActionResult:
         success=True,
         deployment=validated_name,
         action="rollback",
-        message=f"Rolled back deployment/{validated_name} to previous revision"
+        message=f"Rolled back deployment/{validated_name} to previous revision",
     )
 
 
@@ -283,19 +293,20 @@ def rollback_deployment(deployment_name: str) -> DeploymentActionResult:
 
 def delete_pod(pod_name: str) -> DeploymentActionResult:
     """
-    Force deletes a specific pod. K8s automatically recreates it.
-    Used for stuck or crash-looping pods that rolling restart won't fix.
-    pod_name validated against same naming rules as deployment names.
+    Force deletes a specific pod. K8s automatically recreates it via the Deployment.
+    Used for stuck or crash-looping pods where rolling restart is insufficient.
+    No retry decorator — this is intentionally a one-shot operation.
     """
     validated_pod = validate_deployment_name(pod_name)
-    log = logger.bind(pod=validated_pod, namespace=NAMESPACE)
+    namespace = _get_namespace()
+    log = logger.bind(pod=validated_pod, namespace=namespace)
     log.info("delete_pod_start")
 
     _run_kubectl([
         "delete", "pod", validated_pod,
-        "-n", NAMESPACE,
+        "-n", namespace,
         "--grace-period=0",
-        "--force"
+        "--force",
     ])
 
     log.info("delete_pod_success")
@@ -303,7 +314,7 @@ def delete_pod(pod_name: str) -> DeploymentActionResult:
         success=True,
         deployment=validated_pod,
         action="delete_pod",
-        message=f"Force deleted pod {validated_pod} — K8s will recreate automatically"
+        message=f"Force deleted pod {validated_pod} — K8s will recreate automatically",
     )
 
 
@@ -312,31 +323,34 @@ def delete_pod(pod_name: str) -> DeploymentActionResult:
 def get_deployment_info(deployment_name: str) -> DeploymentInfo:
     """
     Returns full deployment info: replicas, image, health conditions.
-    Used by RCA agent to understand current deployment state before acting.
+    Called by RCA agent to assess current state before deciding on remediation.
+    Also called internally by scale_deployment to capture previous replica count.
     """
     validated_name = validate_deployment_name(deployment_name)
-    log = logger.bind(deployment=validated_name, namespace=NAMESPACE)
+    namespace = _get_namespace()
+    log = logger.bind(deployment=validated_name, namespace=namespace)
     log.info("get_deployment_info_start")
 
     output = _run_kubectl([
         "get", f"deployment/{validated_name}",
-        "-n", NAMESPACE,
-        "-o", "json"
+        "-n", namespace,
+        "-o", "json",
     ])
 
     data = json.loads(output)
     spec = data.get("spec", {})
     status = data.get("status", {})
 
-    ready_replicas = status.get("readyReplicas", 0) or 0
-    desired_replicas = spec.get("replicas", 0) or 0
+    desired_replicas: int = spec.get("replicas", 0) or 0
+    ready_replicas: int = status.get("readyReplicas", 0) or 0
+    available_replicas: int = status.get("availableReplicas", 0) or 0
 
     conditions = [
         DeploymentCondition(
             type=c.get("type", "Unknown"),
             status=c.get("status", "Unknown"),
             reason=c.get("reason"),
-            message=c.get("message")
+            message=c.get("message"),
         )
         for c in status.get("conditions", [])
     ]
@@ -345,7 +359,7 @@ def get_deployment_info(deployment_name: str) -> DeploymentInfo:
         name=validated_name,
         desired_replicas=desired_replicas,
         ready_replicas=ready_replicas,
-        available_replicas=status.get("availableReplicas", 0) or 0,
+        available_replicas=available_replicas,
         image=(
             spec.get("template", {})
                 .get("spec", {})
@@ -353,14 +367,14 @@ def get_deployment_info(deployment_name: str) -> DeploymentInfo:
                 .get("image", "unknown")
         ),
         conditions=conditions,
-        is_healthy=(desired_replicas > 0 and ready_replicas == desired_replicas)
+        is_healthy=(desired_replicas > 0 and ready_replicas == desired_replicas),
     )
 
     log.info(
         "get_deployment_info_complete",
         desired=result.desired_replicas,
         ready=result.ready_replicas,
-        healthy=result.is_healthy
+        healthy=result.is_healthy,
     )
     return result
 
@@ -369,32 +383,34 @@ def get_deployment_info(deployment_name: str) -> DeploymentInfo:
 
 def list_deployments() -> list[DeploymentSummary]:
     """
-    Lists all deployments in the autoops namespace with health status.
-    Used by supervisor agent for initial cluster state assessment.
+    Lists all deployments in the configured namespace with health status.
+    Called by supervisor agent at the start of every incident investigation
+    to get a full picture of the cluster state.
     """
-    log = logger.bind(namespace=NAMESPACE)
+    namespace = _get_namespace()
+    log = logger.bind(namespace=namespace)
     log.info("list_deployments_start")
 
     output = _run_kubectl([
         "get", "deployments",
-        "-n", NAMESPACE,
-        "-o", "json"
+        "-n", namespace,
+        "-o", "json",
     ])
 
     data = json.loads(output)
     summaries: list[DeploymentSummary] = []
 
     for item in data.get("items", []):
-        desired = item["spec"].get("replicas", 0) or 0
-        ready = item["status"].get("readyReplicas", 0) or 0
-        available = item["status"].get("availableReplicas", 0) or 0
+        desired: int = item["spec"].get("replicas", 0) or 0
+        ready: int = item["status"].get("readyReplicas", 0) or 0
+        available: int = item["status"].get("availableReplicas", 0) or 0
 
         summaries.append(DeploymentSummary(
             name=item["metadata"]["name"],
             desired=desired,
             ready=ready,
             available=available,
-            is_healthy=(desired > 0 and ready == desired)
+            is_healthy=(desired > 0 and ready == desired),
         ))
 
     log.info("list_deployments_complete", count=len(summaries))
